@@ -1,4 +1,6 @@
 ./ddpm_unet.pth
 ./gan_generator.pth
 /venv 
+/CV
 /KMAR-50K
+/data
