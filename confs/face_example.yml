@@ -19,17 +19,16 @@ clip_denoised: true
 predict_xstart: false
 rescale_timesteps: false
 show_progress: true
-timestep_respacing: '250'
+timestep_respacing: '100'
 image_size: 256
 model_path: ./data/pretrained/celeba256_250000.pt
 name: face_example
 inpa_inj_sched_prev: true
-inpa_inj_sched_prev_cumnoise: false
 schedule_jump_params:
-  t_T: 250
+  t_T: 100
   n_sample: 1
   jump_length: 10
-  jump_n_sample: 10
+  jump_n_sample: 3
 data:
   eval:
     paper_face_mask:
