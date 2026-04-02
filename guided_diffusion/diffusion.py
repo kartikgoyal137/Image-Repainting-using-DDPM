@@ -2,30 +2,25 @@
 
 import numpy as np
 import torch as th
-from collections import defaultdict
 
 
-def get_named_beta_schedule(num_diffusion_timesteps):
-    scale = 1000 / num_diffusion_timesteps
-    return np.linspace(scale * 0.0001, scale * 0.02, num_diffusion_timesteps, dtype=np.float64)
+def get_named_beta_schedule(steps):
+    s = 1000 / steps
+    return np.linspace(s * 0.0001, s * 0.02, steps, dtype=np.float64)
 
 
-def get_schedule_jump(t_T, n_sample, jump_length, jump_n_sample, **kwargs):
-    """Generate the RePaint resampling schedule (single-level jumps)."""
+def get_schedule_jump(t_T, n_sample, jump_length, jump_n_sample, **kw):
     jumps = {j: jump_n_sample - 1 for j in range(0, t_T - jump_length, jump_length)}
     t, ts = t_T, []
     while t >= 1:
-        t -= 1
-        ts.append(t)
+        t -= 1; ts.append(t)
         if t + 1 < t_T - 1:
             for _ in range(n_sample - 1):
                 t += 1; ts.append(t)
-                if t >= 0:
-                    t -= 1; ts.append(t)
+                if t >= 0: t -= 1; ts.append(t)
         if jumps.get(t, 0) > 0:
             jumps[t] -= 1
-            for _ in range(jump_length):
-                t += 1; ts.append(t)
+            for _ in range(jump_length): t += 1; ts.append(t)
     ts.append(-1)
     return ts
 
@@ -38,169 +33,109 @@ def space_timesteps(num_timesteps, section_counts):
     size_per = num_timesteps // len(section_counts)
     extra = num_timesteps % len(section_counts)
     start_idx, all_steps = 0, []
-    for i, section_count in enumerate(section_counts):
+    for i, sc in enumerate(section_counts):
         size = size_per + (1 if i < extra else 0)
-        frac_stride = 1 if section_count <= 1 else (size - 1) / (section_count - 1)
-        cur_idx = 0.0
-        for _ in range(section_count):
-            all_steps.append(start_idx + round(cur_idx))
-            cur_idx += frac_stride
+        stride = 1 if sc <= 1 else (size - 1) / (sc - 1)
+        for j in range(sc):
+            all_steps.append(start_idx + round(j * stride))
         start_idx += size
     return set(all_steps)
 
 
-def _extract(arr, timesteps, broadcast_shape):
-    res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
-    while len(res.shape) < len(broadcast_shape):
-        res = res[..., None]
-    return res.expand(broadcast_shape)
+def _ex(arr, t, shape):
+    r = th.from_numpy(arr).to(device=t.device)[t].float()
+    while len(r.shape) < len(shape): r = r[..., None]
+    return r.expand(shape)
 
 
 class GaussianDiffusion:
-    def __init__(self, betas, learn_sigma=False, rescale_timesteps=False, conf=None):
-        self.rescale_timesteps = rescale_timesteps
+    def __init__(self, betas, conf=None, **kw):
         self.conf = conf
-        self.learn_sigma = learn_sigma
-
         betas = np.array(betas, dtype=np.float64)
         self.betas = betas
-        self.num_timesteps = int(betas.shape[0])
-
+        self.num_timesteps = len(betas)
         alphas = 1.0 - betas
-        self.alphas_cumprod = np.cumprod(alphas, axis=0)
-        ac_prev = np.append(1.0, self.alphas_cumprod[:-1])
-
-        self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
-        self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
-
-        self.posterior_variance = betas * (1.0 - ac_prev) / (1.0 - self.alphas_cumprod)
-        self.posterior_log_variance_clipped = np.log(
-            np.append(self.posterior_variance[1], self.posterior_variance[1:]))
-        self.posterior_mean_coef1 = betas * np.sqrt(ac_prev) / (1.0 - self.alphas_cumprod)
-        self.posterior_mean_coef2 = (1.0 - ac_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod)
+        ac = self.alphas_cumprod = np.cumprod(alphas, axis=0)
+        ac_prev = np.append(1.0, ac[:-1])
+        self.sqrt_recip_ac = np.sqrt(1.0 / ac)
+        self.sqrt_recipm1_ac = np.sqrt(1.0 / ac - 1)
+        pv = self.posterior_variance = betas * (1.0 - ac_prev) / (1.0 - ac)
+        self.post_log_var = np.log(np.append(pv[1], pv[1:]))
+        self.post_coef1 = betas * np.sqrt(ac_prev) / (1.0 - ac)
+        self.post_coef2 = (1.0 - ac_prev) * np.sqrt(alphas) / (1.0 - ac)
 
     def p_mean_variance(self, model, x, t, clip_denoised=True, model_kwargs=None):
-        if model_kwargs is None:
-            model_kwargs = {}
         B, C = x.shape[:2]
-        model_output = model(x, self._scale_timesteps(t), **model_kwargs)
-        model_output, model_var_values = th.split(model_output, C, dim=1)
-
-        if self.learn_sigma:
-            min_log = _extract(self.posterior_log_variance_clipped, t, x.shape)
-            max_log = _extract(np.log(self.betas), t, x.shape)
-            frac = (model_var_values + 1) / 2
-            log_variance = frac * max_log + (1 - frac) * min_log
-        else:
-            log_variance = _extract(np.log(np.append(self.posterior_variance[1],
-                                   self.betas[1:])), t, x.shape)
-
-        # Epsilon prediction (DDPM)
-        pred_xstart = (
-            _extract(self.sqrt_recip_alphas_cumprod, t, x.shape) * x
-            - _extract(self.sqrt_recipm1_alphas_cumprod, t, x.shape) * model_output
-        )
-        if clip_denoised:
-            pred_xstart = pred_xstart.clamp(-1, 1)
-
-        mean = (
-            _extract(self.posterior_mean_coef1, t, x.shape) * pred_xstart
-            + _extract(self.posterior_mean_coef2, t, x.shape) * x
-        )
-        return mean, log_variance, pred_xstart
+        out = model(x, self._scale_timesteps(t), **(model_kwargs or {}))
+        eps, var_val = th.split(out, C, dim=1)
+        # Learned range variance
+        min_log = _ex(self.post_log_var, t, x.shape)
+        max_log = _ex(np.log(self.betas), t, x.shape)
+        log_var = ((var_val + 1) / 2) * max_log + ((1 - var_val) / 2 + 0.5) * min_log
+        # Epsilon -> x0
+        pred_x0 = _ex(self.sqrt_recip_ac, t, x.shape) * x - _ex(self.sqrt_recipm1_ac, t, x.shape) * eps
+        if clip_denoised: pred_x0 = pred_x0.clamp(-1, 1)
+        mean = _ex(self.post_coef1, t, x.shape) * pred_x0 + _ex(self.post_coef2, t, x.shape) * x
+        return mean, log_var, pred_x0
 
     def p_sample(self, model, x, t, clip_denoised=True, model_kwargs=None,
-                 conf=None, pred_xstart=None, **kwargs):
+                 conf=None, pred_xstart=None, **kw):
         noise = th.randn_like(x)
-
-        # RePaint: inject known region with noise at this timestep
         if conf.inpa_inj_sched_prev and pred_xstart is not None:
-            gt = model_kwargs['gt']
-            mask = model_kwargs.get('gt_keep_mask')
-            ac = _extract(self.alphas_cumprod, t, x.shape)
-            noised_gt = th.sqrt(ac) * gt + th.sqrt(1 - ac) * th.randn_like(x)
-            x = mask * noised_gt + (1 - mask) * x
+            gt, mask = model_kwargs['gt'], model_kwargs.get('gt_keep_mask')
+            ac = _ex(self.alphas_cumprod, t, x.shape)
+            x = mask * (th.sqrt(ac) * gt + th.sqrt(1 - ac) * th.randn_like(x)) + (1 - mask) * x
 
-        mean, log_variance, pred_xstart = self.p_mean_variance(
-            model, x, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs)
-
-        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-        sample = mean + nonzero_mask * th.exp(0.5 * log_variance) * noise
-
-        return {"sample": sample, "pred_xstart": pred_xstart, "gt": model_kwargs.get('gt')}
+        mean, log_var, pred_x0 = self.p_mean_variance(model, x, t, clip_denoised, model_kwargs)
+        nz = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        return {"sample": mean + nz * th.exp(0.5 * log_var) * noise,
+                "pred_xstart": pred_x0, "gt": model_kwargs.get('gt')}
 
     def undo(self, img, t):
-        beta = _extract(self.betas, t, img.shape)
-        return th.sqrt(1 - beta) * img + th.sqrt(beta) * th.randn_like(img)
+        b = _ex(self.betas, t, img.shape)
+        return th.sqrt(1 - b) * img + th.sqrt(b) * th.randn_like(img)
 
     def p_sample_loop(self, model, shape, clip_denoised=True, model_kwargs=None,
-                      device=None, progress=True, return_all=False, conf=None, **kwargs):
-        if device is None:
-            device = next(model.parameters()).device
-
-        img = th.randn(*shape, device=device)
-        pred_xstart = None
-        out = None
-
+                      device=None, progress=True, return_all=False, conf=None, **kw):
+        device = device or next(model.parameters()).device
+        img, pred_xstart, out = th.randn(*shape, device=device), None, None
         times = get_schedule_jump(**conf.schedule_jump_params)
-        time_pairs = list(zip(times[:-1], times[1:]))
+        pairs = list(zip(times[:-1], times[1:]))
         if progress:
-            from tqdm.auto import tqdm
-            time_pairs = tqdm(time_pairs)
-
-        for t_last, t_cur in time_pairs:
-            t_batch = th.tensor([t_last] * shape[0], device=device)
-            if t_cur < t_last:  # denoise step
+            from tqdm.auto import tqdm; pairs = tqdm(pairs)
+        for t_last, t_cur in pairs:
+            tb = th.tensor([t_last] * shape[0], device=device)
+            if t_cur < t_last:
                 with th.no_grad():
-                    out = self.p_sample(model, img, t_batch, clip_denoised=clip_denoised,
-                                        model_kwargs=model_kwargs, conf=conf,
-                                        pred_xstart=pred_xstart)
-                    img = out["sample"]
-                    pred_xstart = out["pred_xstart"]
-            else:  # undo (re-noise) step
-                t_shift = conf.get('inpa_inj_time_shift', 1)
-                img = self.undo(img, t_batch + t_shift)
-
+                    out = self.p_sample(model, img, tb, clip_denoised, model_kwargs, conf, pred_xstart)
+                    img, pred_xstart = out["sample"], out["pred_xstart"]
+            else:
+                img = self.undo(img, tb + conf.get('inpa_inj_time_shift', 1))
         return out if return_all else out["sample"]
 
-    def _scale_timesteps(self, t):
-        return t.float() * (1000.0 / self.num_timesteps) if self.rescale_timesteps else t
+    def _scale_timesteps(self, t): return t
 
 
 class SpacedDiffusion(GaussianDiffusion):
-    """Diffusion with timestep respacing for faster inference."""
     def __init__(self, use_timesteps, **kwargs):
         betas = kwargs["betas"]
-        original_alphas_cumprod = np.cumprod(1.0 - betas, axis=0)
-        self.timestep_map = []
-        new_betas = []
-        last_ac = 1.0
-        for i, ac in enumerate(original_alphas_cumprod):
+        ac = np.cumprod(1.0 - betas, axis=0)
+        self.timestep_map, new_betas, last = [], [], 1.0
+        for i, a in enumerate(ac):
             if i in set(use_timesteps):
-                new_betas.append(1 - ac / last_ac)
-                last_ac = ac
+                new_betas.append(1 - a / last); last = a
                 self.timestep_map.append(i)
         kwargs["betas"] = np.array(new_betas)
         super().__init__(**kwargs)
 
-    def p_mean_variance(self, model, *args, **kwargs):
-        return super().p_mean_variance(self._wrap(model), *args, **kwargs)
+    def p_mean_variance(self, model, *a, **kw):
+        return super().p_mean_variance(self._wrap(model), *a, **kw)
 
     def _wrap(self, model):
-        if isinstance(model, _W):
-            return model
+        if isinstance(model, _W): return model
         return _W(model, self.timestep_map)
 
-    def _scale_timesteps(self, t):
-        return t
-
-
 class _W:
-    """Wraps model to remap timesteps for spaced diffusion."""
-    def __init__(self, model, timestep_map):
-        self.model = model
-        self.timestep_map = timestep_map
-
-    def __call__(self, x, ts, **kwargs):
-        map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
-        return self.model(x, map_tensor[ts], **kwargs)
+    def __init__(self, m, tmap): self.m, self.tmap = m, tmap
+    def __call__(self, x, ts, **kw):
+        return self.m(x, th.tensor(self.tmap, device=ts.device, dtype=ts.dtype)[ts], **kw)

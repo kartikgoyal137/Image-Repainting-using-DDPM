@@ -6,63 +6,28 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# --- nn helpers (inlined) ---
-
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
         return super().forward(x.float()).type(x.dtype)
 
+def norm(ch): return GroupNorm32(32, ch)
+def conv(ci, co, k, **kw): return nn.Conv2d(ci, co, k, **kw)
+def conv1d(ci, co, k): return nn.Conv1d(ci, co, k)
 
-def conv_nd(dims, *args, **kwargs):
-    return {1: nn.Conv1d, 2: nn.Conv2d, 3: nn.Conv3d}[dims](*args, **kwargs)
+def zero_module(m):
+    for p in m.parameters(): p.detach().zero_()
+    return m
 
-
-def zero_module(module):
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
-
-
-def normalization(channels):
-    return GroupNorm32(32, channels)
-
-
-def timestep_embedding(timesteps, dim, max_period=10000):
+def timestep_embedding(t, dim):
     half = dim // 2
-    freqs = th.exp(
-        -math.log(max_period) * th.arange(start=0, end=half, dtype=th.float32) / half
-    ).to(device=timesteps.device)
-    args = timesteps[:, None].float() * freqs[None]
-    embedding = th.cat([th.cos(args), th.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = th.cat([embedding, th.zeros_like(embedding[:, :1])], dim=-1)
-    return embedding
-
-
-# --- FP16 conversion ---
-
-def convert_module_to_f16(l):
-    if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-        l.weight.data = l.weight.data.half()
-        if l.bias is not None:
-            l.bias.data = l.bias.data.half()
-
-
-def convert_module_to_f32(l):
-    if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-        l.weight.data = l.weight.data.float()
-        if l.bias is not None:
-            l.bias.data = l.bias.data.float()
-
-
-# --- Model blocks ---
+    f = th.exp(-math.log(10000) * th.arange(half, dtype=th.float32) / half).to(t.device)
+    a = t[:, None].float() * f[None]
+    e = th.cat([th.cos(a), th.sin(a)], dim=-1)
+    return th.cat([e, th.zeros_like(e[:, :1])], dim=-1) if dim % 2 else e
 
 class TimestepBlock(nn.Module):
     @abstractmethod
-    def forward(self, x, emb):
-        pass
-
+    def forward(self, x, emb): pass
 
 class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     def forward(self, x, emb):
@@ -70,229 +35,137 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
             x = layer(x, emb) if isinstance(layer, TimestepBlock) else layer(x)
         return x
 
-
 class Upsample(nn.Module):
-    def __init__(self, channels, use_conv, dims=2, out_channels=None):
+    def __init__(self, ch, use_conv, out_channels=None, **kw):
         super().__init__()
-        self.channels = channels
-        self.out_channels = out_channels or channels
         self.use_conv = use_conv
-        if use_conv:
-            self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=1)
-
+        if use_conv: self.conv = conv(ch, out_channels or ch, 3, padding=1)
     def forward(self, x):
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         return self.conv(x) if self.use_conv else x
 
-
 class Downsample(nn.Module):
-    def __init__(self, channels, use_conv, dims=2, out_channels=None):
+    def __init__(self, ch, use_conv, out_channels=None, **kw):
         super().__init__()
-        self.channels = channels
-        self.out_channels = out_channels or channels
-        stride = 2 if dims != 3 else (1, 2, 2)
-        if use_conv:
-            self.op = conv_nd(dims, self.channels, self.out_channels, 3, stride=stride, padding=1)
-        else:
-            self.op = nn.AvgPool2d(kernel_size=stride, stride=stride)
-
-    def forward(self, x):
-        return self.op(x)
-
+        oc = out_channels or ch
+        self.op = conv(ch, oc, 3, stride=2, padding=1) if use_conv else nn.AvgPool2d(2, 2)
+    def forward(self, x): return self.op(x)
 
 class ResBlock(TimestepBlock):
-    def __init__(self, channels, emb_channels, dropout, out_channels=None,
-                 use_conv=False, use_scale_shift_norm=False, dims=2,
-                 use_checkpoint=False, up=False, down=False):
+    def __init__(self, ch, emb_ch, dropout, out_channels=None, use_conv=False,
+                 use_scale_shift_norm=False, up=False, down=False, **kw):
         super().__init__()
-        self.out_channels = out_channels or channels
+        oc = self.out_channels = out_channels or ch
         self.use_scale_shift_norm = use_scale_shift_norm
-
-        self.in_layers = nn.Sequential(
-            normalization(channels), nn.SiLU(),
-            conv_nd(dims, channels, self.out_channels, 3, padding=1),
-        )
+        self.in_layers = nn.Sequential(norm(ch), nn.SiLU(), conv(ch, oc, 3, padding=1))
         self.updown = up or down
-        if up:
-            self.h_upd = Upsample(channels, False, dims)
-            self.x_upd = Upsample(channels, False, dims)
-        elif down:
-            self.h_upd = Downsample(channels, False, dims)
-            self.x_upd = Downsample(channels, False, dims)
-        else:
-            self.h_upd = self.x_upd = nn.Identity()
-
-        self.emb_layers = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(emb_channels, 2 * self.out_channels if use_scale_shift_norm else self.out_channels),
-        )
-        self.out_layers = nn.Sequential(
-            normalization(self.out_channels), nn.SiLU(), nn.Dropout(p=dropout),
-            zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)),
-        )
-        if self.out_channels == channels:
-            self.skip_connection = nn.Identity()
-        elif use_conv:
-            self.skip_connection = conv_nd(dims, channels, self.out_channels, 3, padding=1)
-        else:
-            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+        if up:    self.h_upd, self.x_upd = Upsample(ch, False), Upsample(ch, False)
+        elif down: self.h_upd, self.x_upd = Downsample(ch, False), Downsample(ch, False)
+        else:     self.h_upd = self.x_upd = nn.Identity()
+        self.emb_layers = nn.Sequential(nn.SiLU(), nn.Linear(emb_ch, 2*oc if use_scale_shift_norm else oc))
+        self.out_layers = nn.Sequential(norm(oc), nn.SiLU(), nn.Dropout(p=dropout), zero_module(conv(oc, oc, 3, padding=1)))
+        if oc == ch:      self.skip_connection = nn.Identity()
+        elif use_conv:     self.skip_connection = conv(ch, oc, 3, padding=1)
+        else:              self.skip_connection = conv(ch, oc, 1)
 
     def forward(self, x, emb):
         if self.updown:
-            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
-            h = self.h_upd(in_rest(x))
+            h = self.in_layers[-1](self.h_upd(self.in_layers[:-1](x)))
             x = self.x_upd(x)
-            h = in_conv(h)
         else:
             h = self.in_layers(x)
         emb_out = self.emb_layers(emb).type(h.dtype)
-        while len(emb_out.shape) < len(h.shape):
-            emb_out = emb_out[..., None]
+        while len(emb_out.shape) < len(h.shape): emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
-            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-            scale, shift = th.chunk(emb_out, 2, dim=1)
-            h = out_rest(out_norm(h) * (1 + scale) + shift)
+            s, sh = th.chunk(emb_out, 2, dim=1)
+            h = self.out_layers[1:]( self.out_layers[0](h) * (1 + s) + sh)
         else:
             h = self.out_layers(h + emb_out)
         return self.skip_connection(x) + h
 
-
 class AttentionBlock(nn.Module):
-    def __init__(self, channels, num_heads=1, num_head_channels=-1,
-                 use_checkpoint=False, use_new_attention_order=False):
+    def __init__(self, ch, num_heads=1, num_head_channels=-1, **kw):
         super().__init__()
-        self.channels = channels
-        self.num_heads = channels // num_head_channels if num_head_channels != -1 else num_heads
-        self.norm = normalization(channels)
-        self.qkv = conv_nd(1, channels, channels * 3, 1)
-        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+        self.num_heads = ch // num_head_channels if num_head_channels != -1 else num_heads
+        self.norm = norm(ch)
+        self.qkv = conv1d(ch, ch * 3, 1)
+        self.proj_out = zero_module(conv1d(ch, ch, 1))
 
     def forward(self, x):
-        b, c, *spatial = x.shape
+        b, c, *sp = x.shape
         x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
-        # QKVAttentionLegacy
-        bs, width, length = qkv.shape
-        ch = width // (3 * self.num_heads)
-        q, k, v = qkv.reshape(bs * self.num_heads, ch * 3, length).split(ch, dim=1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = th.einsum("bct,bcs->bts", q * scale, k * scale)
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        h = th.einsum("bts,bcs->bct", weight, v).reshape(bs, -1, length)
-        return (x + self.proj_out(h)).reshape(b, c, *spatial)
-
+        bs, w, l = qkv.shape
+        ch = w // (3 * self.num_heads)
+        q, k, v = qkv.reshape(bs * self.num_heads, ch * 3, l).split(ch, dim=1)
+        sc = 1 / math.sqrt(math.sqrt(ch))
+        wt = th.softmax(th.einsum("bct,bcs->bts", q * sc, k * sc).float(), dim=-1).type(q.dtype)
+        h = th.einsum("bts,bcs->bct", wt, v).reshape(bs, -1, l)
+        return (x + self.proj_out(h)).reshape(b, c, *sp)
 
 class UNetModel(nn.Module):
     def __init__(self, image_size, in_channels, model_channels, out_channels,
                  num_res_blocks, attention_resolutions, dropout=0,
-                 channel_mult=(1, 2, 4, 8), conv_resample=True, dims=2,
-                 num_classes=None, use_checkpoint=False, use_fp16=False,
-                 num_heads=1, num_head_channels=-1, num_heads_upsample=-1,
-                 use_scale_shift_norm=False, resblock_updown=False,
-                 use_new_attention_order=False, conf=None):
+                 channel_mult=(1,2,4,8), conv_resample=True, num_classes=None,
+                 use_fp16=False, num_heads=1, num_head_channels=-1,
+                 num_heads_upsample=-1, use_scale_shift_norm=False,
+                 resblock_updown=False, **kw):
         super().__init__()
-        if num_heads_upsample == -1:
-            num_heads_upsample = num_heads
-
+        if num_heads_upsample == -1: num_heads_upsample = num_heads
         self.model_channels = model_channels
         self.num_classes = num_classes
         self.dtype = th.float16 if use_fp16 else th.float32
-
-        time_embed_dim = model_channels * 4
-        self.time_embed = nn.Sequential(
-            nn.Linear(model_channels, time_embed_dim), nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-        )
+        ted = model_channels * 4
+        self.time_embed = nn.Sequential(nn.Linear(model_channels, ted), nn.SiLU(), nn.Linear(ted, ted))
         if num_classes is not None:
-            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+            self.label_emb = nn.Embedding(num_classes, ted)
 
         ch = input_ch = int(channel_mult[0] * model_channels)
-        self.input_blocks = nn.ModuleList(
-            [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))])
-        input_block_chans = [ch]
-        ds = 1
+        self.input_blocks = nn.ModuleList([TimestepEmbedSequential(conv(in_channels, ch, 3, padding=1))])
+        ibc = [ch]; ds = 1
+        RB = lambda c, oc, **k: ResBlock(c, ted, dropout, out_channels=oc, use_scale_shift_norm=use_scale_shift_norm, **k)
+        AB = lambda c: AttentionBlock(c, num_heads=num_heads, num_head_channels=num_head_channels)
         for level, mult in enumerate(channel_mult):
             for _ in range(num_res_blocks):
-                layers = [ResBlock(ch, time_embed_dim, dropout,
-                                   out_channels=int(mult * model_channels), dims=dims,
-                                   use_checkpoint=use_checkpoint,
-                                   use_scale_shift_norm=use_scale_shift_norm)]
-                ch = int(mult * model_channels)
-                if ds in attention_resolutions:
-                    layers.append(AttentionBlock(ch, num_heads=num_heads,
-                                                 num_head_channels=num_head_channels))
-                self.input_blocks.append(TimestepEmbedSequential(*layers))
-                input_block_chans.append(ch)
+                oc = int(mult * model_channels)
+                layers = [RB(ch, oc)]
+                ch = oc
+                if ds in attention_resolutions: layers.append(AB(ch))
+                self.input_blocks.append(TimestepEmbedSequential(*layers)); ibc.append(ch)
             if level != len(channel_mult) - 1:
-                out_ch = ch
                 self.input_blocks.append(TimestepEmbedSequential(
-                    ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims,
-                             use_checkpoint=use_checkpoint,
-                             use_scale_shift_norm=use_scale_shift_norm, down=True)
-                    if resblock_updown
-                    else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)))
-                ch = out_ch
-                input_block_chans.append(ch)
-                ds *= 2
+                    RB(ch, ch, down=True) if resblock_updown else Downsample(ch, conv_resample, out_channels=ch)))
+                ibc.append(ch); ds *= 2
 
-        self.middle_block = TimestepEmbedSequential(
-            ResBlock(ch, time_embed_dim, dropout, dims=dims, use_checkpoint=use_checkpoint,
-                     use_scale_shift_norm=use_scale_shift_norm),
-            AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels),
-            ResBlock(ch, time_embed_dim, dropout, dims=dims, use_checkpoint=use_checkpoint,
-                     use_scale_shift_norm=use_scale_shift_norm),
-        )
-
+        self.middle_block = TimestepEmbedSequential(RB(ch, ch), AB(ch), RB(ch, ch))
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
-                ich = input_block_chans.pop()
-                layers = [ResBlock(ch + ich, time_embed_dim, dropout,
-                                   out_channels=int(model_channels * mult), dims=dims,
-                                   use_checkpoint=use_checkpoint,
-                                   use_scale_shift_norm=use_scale_shift_norm)]
-                ch = int(model_channels * mult)
+                ich = ibc.pop(); oc = int(model_channels * mult)
+                layers = [RB(ch + ich, oc)]
+                ch = oc
                 if ds in attention_resolutions:
-                    layers.append(AttentionBlock(ch, num_heads=num_heads_upsample,
-                                                 num_head_channels=num_head_channels))
+                    layers.append(AttentionBlock(ch, num_heads=num_heads_upsample, num_head_channels=num_head_channels))
                 if level and i == num_res_blocks:
-                    out_ch = ch
-                    layers.append(
-                        ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims,
-                                 use_checkpoint=use_checkpoint,
-                                 use_scale_shift_norm=use_scale_shift_norm, up=True)
-                        if resblock_updown
-                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch))
+                    layers.append(RB(ch, ch, up=True) if resblock_updown else Upsample(ch, conv_resample, out_channels=ch))
                     ds //= 2
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
-
-        self.out = nn.Sequential(
-            normalization(ch), nn.SiLU(),
-            zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
-        )
+        self.out = nn.Sequential(norm(ch), nn.SiLU(), zero_module(conv(input_ch, out_channels, 3, padding=1)))
 
     def convert_to_fp16(self):
-        self.input_blocks.apply(convert_module_to_f16)
-        self.middle_block.apply(convert_module_to_f16)
-        self.output_blocks.apply(convert_module_to_f16)
-
-    def convert_to_fp32(self):
-        self.input_blocks.apply(convert_module_to_f32)
-        self.middle_block.apply(convert_module_to_f32)
-        self.output_blocks.apply(convert_module_to_f32)
+        def f(l):
+            if isinstance(l, (nn.Conv1d, nn.Conv2d)):
+                l.weight.data = l.weight.data.half()
+                if l.bias is not None: l.bias.data = l.bias.data.half()
+        self.input_blocks.apply(f); self.middle_block.apply(f); self.output_blocks.apply(f)
 
     def forward(self, x, timesteps, y=None, gt=None, **kwargs):
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
         if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
         h = x.type(self.dtype)
-        for module in self.input_blocks:
-            h = module(h, emb)
-            hs.append(h)
+        for m in self.input_blocks: h = m(h, emb); hs.append(h)
         h = self.middle_block(h, emb)
-        for module in self.output_blocks:
-            h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb)
+        for m in self.output_blocks: h = m(th.cat([h, hs.pop()], dim=1), emb)
         return self.out(h.type(x.dtype))
