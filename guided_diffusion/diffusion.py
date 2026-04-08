@@ -8,9 +8,23 @@ def get_named_beta_schedule(steps):
     s = 1000 / steps
     return np.linspace(s * 0.0001, s * 0.02, steps, dtype=np.float64)
 
+def get_U(U_min=1, U_max=10, A=None, D=None, mode='A'):
+    if mode == 'A':
+        score = A
+    elif mode == 'D':
+        score = min(D / 50.0, 1.0)
+    elif mode == 'AD':
+        score = 0.5 * (A ** 0.5) + 0.5 * min(D / 50.0, 1.0)
+    else:
+        raise ValueError(f"Unknown dynamic_U mode: {mode}")
+    return U_min + int((U_max - U_min) * score)
 
 def get_schedule_jump(t_T, n_sample, jump_length, jump_n_sample, **kw):
-    jumps = {j: jump_n_sample - 1 for j in range(0, t_T - jump_length, jump_length)}
+    def resolve_u(j):
+        if callable(jump_n_sample):
+            return jump_n_sample(j)
+        return jump_n_sample
+    jumps = {j: resolve_u(j) - 1 for j in range(0, t_T - jump_length, jump_length)}
     t, ts = t_T, []
     while t >= 1:
         t -= 1; ts.append(t)
@@ -99,7 +113,40 @@ class GaussianDiffusion:
                       device=None, progress=True, return_all=False, conf=None, **kw):
         device = device or next(model.parameters()).device
         img, pred_xstart, out = th.randn(*shape, device=device), None, None
-        times = get_schedule_jump(**conf.schedule_jump_params)
+        jump_params = dict(conf.schedule_jump_params)
+        du = conf.pget('dynamic_U')
+        if du:
+            mode  = du.get('mode', 'A')
+            U_min = du.get('U_min', 1)
+            U_max = du.get('U_max', 10)
+            t_T   = conf.schedule_jump_params['t_T']
+            mask  = model_kwargs.get('gt_keep_mask')
+
+            def compute_D(mask):
+                import torch.nn.functional as F
+                kernel = th.ones(1, 1, 3, 3, device=mask.device)
+                m = (mask[:, 0:1] > 0.5).float()
+                eroded = F.conv2d(m, kernel, padding=1)
+                boundary = ((eroded < 9) & (m > 0.5)).float()
+                if boundary.sum() == 0:
+                    return 50.0
+                coords = boundary[0, 0].nonzero(as_tuple=False).float()
+                all_coords = th.stack(th.meshgrid(
+                    th.arange(m.shape[-2], device=mask.device),
+                    th.arange(m.shape[-1], device=mask.device), indexing='ij'
+                ), dim=-1).reshape(-1, 2).float()
+                dists = th.cdist(all_coords, coords).min(dim=1).values
+                return dists.mean().item()
+
+            D = compute_D(mask) if mode in ('D', 'AD') else None
+
+            def u_fn(j):
+                A = j / t_T
+                return get_U(U_min=U_min, U_max=U_max, A=A, D=D, mode=mode)
+
+            jump_params['jump_n_sample'] = u_fn
+
+        times = get_schedule_jump(**jump_params)
         pairs = list(zip(times[:-1], times[1:]))
         if progress:
             from tqdm.auto import tqdm; pairs = tqdm(pairs)

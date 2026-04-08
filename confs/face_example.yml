@@ -29,6 +29,10 @@ schedule_jump_params:
   n_sample: 1
   jump_length: 10
   jump_n_sample: 3
+dynamic_U:
+  mode: A # 'A', 'D' or 'AD'
+  U_min: 1
+  U_max: 10
 data:
   eval:
     paper_face_mask:
