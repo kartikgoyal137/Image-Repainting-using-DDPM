@@ -1,4 +1,3 @@
-"""Minimal UNet model for diffusion (loads pretrained guided-diffusion weights)."""
 
 from abc import abstractmethod
 import math
@@ -7,12 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 class GroupNorm32(nn.GroupNorm):
-    """GroupNorm that casts to float32 for stability, then back to input dtype."""
     def forward(self, x):
         return super().forward(x.float()).type(x.dtype)
 
@@ -27,13 +22,11 @@ def conv1d(in_ch, out_ch, kernel):
     return nn.Conv1d(in_ch, out_ch, kernel)
 
 def zero_module(module):
-    """Zero-initialize all parameters of a module (standard in diffusion models)."""
     for p in module.parameters():
         p.detach().zero_()
     return module
 
 def timestep_embedding(timesteps, dim):
-    """Sinusoidal timestep embedding."""
     half = dim // 2
     freqs = th.exp(
         -math.log(10000) * th.arange(half, dtype=th.float32) / half
@@ -45,28 +38,20 @@ def timestep_embedding(timesteps, dim):
     return embedding
 
 
-# ---------------------------------------------------------------------------
-# Base classes
-# ---------------------------------------------------------------------------
 
 class TimestepBlock(nn.Module):
-    """A module that takes both x and a timestep embedding as input."""
     @abstractmethod
     def forward(self, x, emb):
         pass
 
 
 class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
-    """Sequential that passes the timestep embedding to any TimestepBlock inside."""
     def forward(self, x, emb):
         for layer in self:
             x = layer(x, emb) if isinstance(layer, TimestepBlock) else layer(x)
         return x
 
 
-# ---------------------------------------------------------------------------
-# Up/Downsample
-# ---------------------------------------------------------------------------
 
 class Upsample(nn.Module):
     def __init__(self, channels, use_conv, out_channels=None, **kw):
@@ -90,9 +75,6 @@ class Downsample(nn.Module):
         return self.op(x)
 
 
-# ---------------------------------------------------------------------------
-# Residual block
-# ---------------------------------------------------------------------------
 
 class ResBlock(TimestepBlock):
     def __init__(self, channels, emb_channels, dropout, out_channels=None,
@@ -105,7 +87,6 @@ class ResBlock(TimestepBlock):
             norm(channels), nn.SiLU(), conv2d(channels, out_ch, 3, padding=1)
         )
 
-        # Optional up/downsampling inside the residual path
         self.updown = up or down
         if up:
             self.h_upd = self.x_upd = Upsample(channels, use_conv=False)
@@ -131,8 +112,8 @@ class ResBlock(TimestepBlock):
 
     def forward(self, x, emb):
         if self.updown:
-            h = self.in_layers[:-1](x)   # norm + silu
-            h = self.in_layers[-1](self.h_upd(h))  # conv after upsample
+            h = self.in_layers[:-1](x)   
+            h = self.in_layers[-1](self.h_upd(h))  
             x = self.x_upd(x)
         else:
             h = self.in_layers(x)
@@ -143,17 +124,14 @@ class ResBlock(TimestepBlock):
 
         if self.use_scale_shift_norm:
             scale, shift = th.chunk(emb_out, 2, dim=1)
-            h = self.out_layers[0](h) * (1 + scale) + shift  # norm only
-            h = self.out_layers[1:](h)                        # silu + dropout + conv
+            h = self.out_layers[0](h) * (1 + scale) + shift  
+            h = self.out_layers[1:](h)                        
         else:
             h = self.out_layers(h + emb_out)
 
         return self.skip_connection(x) + h
 
 
-# ---------------------------------------------------------------------------
-# Attention block
-# ---------------------------------------------------------------------------
 
 class AttentionBlock(nn.Module):
     def __init__(self, channels, num_heads=1, num_head_channels=-1, **kw):
@@ -180,9 +158,6 @@ class AttentionBlock(nn.Module):
         return (x_flat + self.proj_out(h)).reshape(B, C, *spatial)
 
 
-# ---------------------------------------------------------------------------
-# UNet
-# ---------------------------------------------------------------------------
 
 class UNetModel(nn.Module):
     def __init__(self, image_size, in_channels, model_channels, out_channels,
@@ -199,7 +174,6 @@ class UNetModel(nn.Module):
         self.num_classes = num_classes
         self.dtype = th.float16 if use_fp16 else th.float32
 
-        # Shorthand builders
         emb_ch = model_channels * 4
         def make_res(in_ch, out_ch, **kwargs):
             return ResBlock(in_ch, emb_ch, dropout, out_channels=out_ch,
@@ -207,14 +181,12 @@ class UNetModel(nn.Module):
         def make_attn(ch, heads):
             return AttentionBlock(ch, num_heads=heads, num_head_channels=num_head_channels)
 
-        # Timestep embedding
         self.time_embed = nn.Sequential(
             nn.Linear(model_channels, emb_ch), nn.SiLU(), nn.Linear(emb_ch, emb_ch)
         )
         if num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, emb_ch)
 
-        # Encoder
         ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList([
             TimestepEmbedSequential(conv2d(in_channels, ch, 3, padding=1))
@@ -238,12 +210,10 @@ class UNetModel(nn.Module):
                 input_block_channels.append(ch)
                 ds *= 2
 
-        # Bottleneck
         self.middle_block = TimestepEmbedSequential(
             make_res(ch, ch), make_attn(ch, num_heads), make_res(ch, ch)
         )
 
-        # Decoder
         self.output_blocks = nn.ModuleList([])
         for level, mult in reversed(list(enumerate(channel_mult))):
             out_ch = int(model_channels * mult)
@@ -265,7 +235,6 @@ class UNetModel(nn.Module):
         )
 
     def convert_to_fp16(self):
-        """Cast conv weights to float16 for mixed-precision inference."""
         def cast(layer):
             if isinstance(layer, (nn.Conv1d, nn.Conv2d)):
                 layer.weight.data = layer.weight.data.half()
@@ -280,17 +249,14 @@ class UNetModel(nn.Module):
         if self.num_classes is not None:
             emb = emb + self.label_emb(y)
 
-        # Encoder — store skip connections
         skips = []
         h = x.type(self.dtype)
         for block in self.input_blocks:
             h = block(h, emb)
             skips.append(h)
 
-        # Bottleneck
         h = self.middle_block(h, emb)
 
-        # Decoder — consume skip connections
         for block in self.output_blocks:
             h = block(th.cat([h, skips.pop()], dim=1), emb)
 
