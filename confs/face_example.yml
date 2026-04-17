@@ -46,10 +46,10 @@ data:
       random_flip: false
       return_dict: true
       drop_last: false
-      batch_size: 1
+      batch_size: 2
       return_dataloader: true
       offset: 0
-      max_len: 2
+      max_len: 4
       paths:
         srs: ./log/face_example/inpainted
         lrs: ./log/face_example/gt_masked

@@ -262,7 +262,7 @@ class GaussianDiffusion:
 
         # Build the U function
         if dynamic_U is not None:
-            mode  = dynamic_U.get('mode', 'A')
+            mode  = dynamic_U.get('mode', 'AD')
             U_min = dynamic_U.get('U_min', 1)
             U_max = dynamic_U.get('U_max', 10)
             D = (compute_boundary_distance(model_kwargs['gt_keep_mask'])

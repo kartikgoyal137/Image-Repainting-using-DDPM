@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from guided_diffusion.unet import UNetModel
 from guided_diffusion.diffusion import (
-    GaussianDiffusion, SpacedDiffusion, space_timesteps, get_named_beta_schedule,
+    GaussianDiffusion, get_named_beta_schedule,
 )
 
 NUM_CLASSES = 1000
@@ -119,14 +119,11 @@ def create_model(conf):
 
 
 def create_diffusion(conf):
-    betas = get_named_beta_schedule(conf.diffusion_steps or 1000)
-    ts_respace = conf.timestep_respacing or [conf.diffusion_steps or 1000]
-
-    return SpacedDiffusion(
-        use_timesteps=space_timesteps(conf.diffusion_steps or 1000, ts_respace),
-        betas=betas, learn_sigma=conf.learn_sigma or False,
-        rescale_timesteps=conf.rescale_timesteps or False, conf=conf,
-    )
+    ts = conf.timestep_respacing or conf.diffusion_steps or 1000
+    if isinstance(ts, str):
+        ts = int(ts.replace("ddim", "")) if "ddim" in ts else int(ts)
+    betas = get_named_beta_schedule(ts)
+    return GaussianDiffusion(betas=betas)
 
 
 # --- Image saving ---
@@ -160,8 +157,14 @@ def main(conf):
 
     diffusion = create_diffusion(conf)
 
+    ts_respace = conf.timestep_respacing or conf.diffusion_steps or 1000
+    if isinstance(ts_respace, str):
+        ts_respace = int(ts_respace.replace("ddim", "")) if "ddim" in ts_respace else int(ts_respace)
+    t_scale = (conf.diffusion_steps or 1000) / ts_respace
+
     def model_fn(x, t, y=None, gt=None, **kw):
-        return model(x, t, y if conf.class_cond else None, gt=gt)
+        scaled_t = (t.float() * t_scale).round().long()
+        return model(x, scaled_t, y if conf.class_cond else None, gt=gt)
 
     # Get eval dataset config
     eval_key = list(conf['data']['eval'].keys())[0]
@@ -187,7 +190,10 @@ def main(conf):
         result = diffusion.p_sample_loop(
             model_fn, (bs, 3, conf.image_size, conf.image_size),
             clip_denoised=conf.clip_denoised, model_kwargs=model_kwargs,
-            device=device, progress=conf.show_progress, return_all=True, conf=conf)
+            device=device, progress=conf.show_progress,
+            jump_length=conf.pget('schedule_jump_params.jump_length', 10),
+            jump_n_sample=conf.pget('schedule_jump_params.jump_n_sample', 10),
+            dynamic_U=conf.pget('dynamic_U', None))
 
         srs = to_u8(result['sample'])
         gts = to_u8(result['gt'])
